@@ -1,0 +1,222 @@
+        [HttpPost("get_widget_pivotold")]
+        public async Task<IActionResult> GetWidgetPivotOld([FromBody] ZBXPivotReq zbxPivotReq)
+        {
+            MResp result = new MResp();
+
+            try
+            {
+                var zbxItemSelections = zbxPivotReq.zbxItemResult
+                .GroupBy(d => d.server_ip)
+                .Select(g => new
+                {
+                    server_ip = g.Key,
+                    hostids = g.Select(x => x.hostid).Distinct().ToList(),
+                    itemids = g.Select(x => x.itemid).Distinct().ToList()
+                })
+                .ToList();
+               
+                result.retdata = zbxItemSelections;
+
+                foreach (var zbxItem in zbxItemSelections)
+                {
+
+                    var widgetDataSource = getDataSource(zbxItem.server_ip);
+
+                    HttpClient client = new HttpClient
+                    {
+                        BaseAddress = new Uri("http://" + widgetDataSource.serverip + "/zabbix/")
+                    };
+
+                    object hostParams = null;
+
+                    if (!widgetDataSource.server_version.StartsWith("6.2") && !widgetDataSource.server_version.StartsWith("7"))
+                    {
+                        hostParams = new
+                        {
+                            output = new[] { "hostid", "name" },
+                            selectGroups = new[] { "groupid", "name" },
+                            hostids = zbxItem.hostids
+                        };
+                    }
+                    else
+                    {
+                        hostParams = new
+                        {
+                            output = new[] { "hostid", "name" },
+                            selectHostGroups = new[] { "groupid", "name" },
+                            hostids = zbxItem.hostids
+                        };
+                    }
+                        
+                    var jsonBodyHost = ZabbixHelper.CreateZabbixRequest("host.get", hostParams, widgetDataSource.authtoken, widgetDataSource.server_version);
+                    var hostResp = await ZabbixHelper.PostZabbixRequestAsync<ZBXHost>(client, widgetDataSource.sourceurl, jsonBodyHost);
+
+                    List<ZBXItemResult> itemResults = new List<ZBXItemResult>();
+
+
+                    if (hostResp.result != null || hostResp.result.Count == 0)
+                    {
+                        foreach (ZBXHostResult zbxHostResult in hostResp.result)
+                        {
+
+                            var itemParam = new
+                            {
+                                output = new[] { "itemid", "hostid", "name", "key_", "lastvalue", "prevvalue", "value_type", "units", "lastclock" },
+                                selectHosts = new[] { "hostid", "name" },
+                                hostids = zbxHostResult.hostid,
+                                itemids = zbxItem.itemids
+                            };
+
+                            var jsonBodyItem = ZabbixHelper.CreateZabbixRequest("item.get", itemParam, widgetDataSource.authtoken, widgetDataSource.server_version);
+                            var objItem = await ZabbixHelper.PostZabbixRequestAsync<ZBXItem>(client, widgetDataSource.sourceurl, jsonBodyItem);
+
+                            if (objItem.result != null && objItem.result.Count > 0)
+                            {
+
+                                if (zbxPivotReq.optionPivot.aggFunc != 0)
+                                {
+                                    foreach (ZBXItemResult itemResult in objItem.result)
+                                    {
+                                        var bodyHistoryFloat = new
+                                        {
+                                            itemids = itemResult.itemid,
+                                            output = new[] { "itemid", "clock", "value" },
+                                            time_from = zbxPivotReq.timeFrom,
+                                            time_till = zbxPivotReq.timeTill,
+                                            history = 0,
+                                            sortfield = "clock",
+                                            sortorder = "DESC"
+                                        };
+
+                                        var jsonBodyHistoryFloat = ZabbixHelper.CreateZabbixRequest("history.get", bodyHistoryFloat, widgetDataSource.authtoken, widgetDataSource.server_version);
+                                        var respHistoryFloat = await ZabbixHelper.PostZabbixRequestAsync<ZBXHistory>(client, widgetDataSource.sourceurl, jsonBodyHistoryFloat);
+
+                                        if (respHistoryFloat?.result != null && respHistoryFloat.result.Count > 0)
+                                        {
+
+                                            int intervalSize = 5;
+                                            int[] intervals = { 5, 10, 15, 30, 60 };
+
+                                            if (zbxPivotReq?.optionPivot?.aggInterval.HasValue == true &&
+                                                zbxPivotReq.optionPivot.aggInterval.Value >= 0 &&
+                                                zbxPivotReq.optionPivot.aggInterval.Value < intervals.Length)
+                                            {
+                                                intervalSize = intervals[zbxPivotReq.optionPivot.aggInterval.Value];
+                                            }
+
+                                            List<ZBXHistoryResult> intervalData;
+
+                                            var itemAgg = "";
+
+                                            if (zbxPivotReq.optionPivot.aggFunc == 1)
+                                            {
+                                                intervalData = ZabbixCalculateHelper.getIntervalMaxValue(respHistoryFloat.result, intervalSize);
+                                                itemAgg = "Max";
+                                            }
+                                            else if (zbxPivotReq.optionPivot.aggFunc == 2)
+                                            {
+                                                intervalData = ZabbixCalculateHelper.getIntervalMinValue(respHistoryFloat.result, intervalSize);
+                                                itemAgg = "Min";
+                                            }
+                                            else if (zbxPivotReq.optionPivot.aggFunc == 3)
+                                            {
+                                                intervalData = ZabbixCalculateHelper.getIntervalAvgValue(respHistoryFloat.result, intervalSize);
+                                                itemAgg = "Avg";
+                                            }
+                                            else
+                                            {
+                                                intervalData = new List<ZBXHistoryResult>();
+                                            }
+
+                                            foreach (ZBXHistoryResult historyResult in intervalData)
+                                            {
+                                                var item = new ZBXItemResult();
+
+                                                if (zbxHostResult.groups.Count > 0)
+                                                {
+                                                    item.hostgroupname = zbxHostResult.groups[0].name;
+                                                }
+                                                else if (zbxHostResult.hostgroups.Count > 0)
+                                                {
+                                                    item.hostgroupname = zbxHostResult.hostgroups[0].name;
+                                                }
+
+                                                if (itemResult != null && itemResult.hosts != null && itemResult.hosts.Count > 0)
+                                                {
+                                                    item.hostname = itemResult.hosts[0].name;
+                                                }
+
+                                                (string zbxLastValue, string zbxUnits) = ZabbixItemUnitHelper.getZbxLastValueFormat(
+                                                    historyResult.value.ToString(), itemResult.units, itemResult.value_type);
+
+                                                item.itemid = itemResult.itemid;
+                                                item.lastvalue = zbxLastValue;
+                                                item.units = zbxUnits;
+                                                item.name = itemResult.name;
+                                                item.agg = itemAgg;
+
+                                                var localTime = DateTimeOffset.FromUnixTimeSeconds(historyResult.clock).LocalDateTime;
+                                                item.lastclock = localTime.ToString("yyyy-MM-dd HH:mm:ss");
+
+                                                itemResults.Add(item);
+                                            }
+
+                                        }
+
+                                    }
+                                }
+                                else
+                                {
+                                    foreach (ZBXItemResult itemResult in objItem.result)
+                                    {
+                                        ZBXItemResult item = new ZBXItemResult();
+
+                                        if (zbxHostResult.groups.Count > 0)
+                                        {
+                                            item.hostgroupname = zbxHostResult.groups[0].name;
+                                        }
+                                        else if (zbxHostResult.hostgroups.Count > 0)
+                                        {
+                                            item.hostgroupname = zbxHostResult.hostgroups[0].name;
+                                        }
+
+                                        if (itemResult?.hosts?.Count > 0)
+                                        {
+                                            item.hostname = itemResult.hosts[0].name;
+                                        }
+
+                                        (string zbxLastValue, string zbxUnits) = ZabbixItemUnitHelper.getZbxLastValueFormat(itemResult.lastvalue, itemResult.units, itemResult.value_type);
+
+                                        item.itemid = itemResult.itemid;
+                                        item.lastvalue = zbxLastValue;
+                                        item.units = zbxUnits;
+                                        item.name = itemResult.name;
+                                        item.lastclock = "0";
+                                        itemResults.Add(item);
+                                    }
+                                }
+
+                                result.retdata = itemResults;
+                            }
+
+
+
+
+                        }
+                    }
+
+
+                    result.retdata = itemResults;
+
+                }
+
+
+            }
+            catch (Exception ex)
+            {
+                result.rettype = 1;
+                result.retmsg = ex.Message;
+            }
+
+            return Ok(result);
+        }
